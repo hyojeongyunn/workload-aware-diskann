@@ -1,90 +1,54 @@
-# DiskANN
+# Workload-Aware DiskANN
 
-[![DiskANN Pull Request Build and Test](https://github.com/microsoft/DiskANN/actions/workflows/pr-test.yml/badge.svg)](https://github.com/microsoft/DiskANN/actions/workflows/pr-test.yml)
+This repository implements a workload-aware extension of DiskANN for disk-based approximate nearest neighbor (ANN) search under memory constraints and out-of-distribution (OOD) queries.
 
-The goal of the project is to build scalable, performant, streaming and cost-effective approximate nearest neighbor search algorithms for large-scale vector search.
-This release has the code from the [DiskANN paper](https://papers.nips.cc/paper/9527-rand-nsg-fast-accurate-billion-point-nearest-neighbor-search-on-a-single-node.pdf) published in NeurIPS 2019, 
-the [streaming DiskANN paper](https://arxiv.org/abs/2105.09613) and improvements. 
-This code reuses and builds upon some of the [code for NSG](https://github.com/ZJULearning/nsg) algorithm.
+Instead of assuming that queries follow the same distribution as the indexed data, we explicitly use real query workloads to drive **sharding**, **disk layout**, and **page-level search**.
 
-This project has adopted the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/).
-For more information see the [Code of Conduct FAQ](https://opensource.microsoft.com/codeofconduct/faq/) or
-contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or comments.
+---
 
-See [guidelines](CONTRIBUTING.md) for contributing to this project.
+## Key Ideas
 
+### 1. Workload-Aware Sharding & Partial Graph Build
 
+- Standard DiskANN shards only on data vectors, so under OOD workloads true neighbors can be scattered across shards and memory usage is hard to control.
+- We use sampled queries (from the same distribution as the offline workload) to perform **workload-aware k-means clustering**:
+  - Queries and data are used together to partition the dataset into shards that better align with query behavior.
+  - Each shard is loaded into memory independently and a graph is built per shard.
+- Graph indexes are stored **per-shard** on disk, so at build time and query time we only need to load a subset of shards, keeping peak memory usage bounded regardless of total dataset size.
 
-## Linux build:
+---
 
-Install the following packages through apt-get
+### 2. Co-Visitation–Based Disk Layout
 
-```bash
-sudo apt install make cmake g++ libaio-dev libgoogle-perftools-dev clang-format libboost-all-dev
-```
+- In the original DiskANN layout, nodes are written to disk in logical ID (or build) order, so nodes that are frequently visited together by real queries often end up on different disk pages.
+- We run beam search for sampled queries on the in-memory graph and log full visitation paths.
+- From these paths we build a **co-visitation graph**:
+  - For each query path, nodes within a small window (±3 hops) are connected with a weighted edge.
+  - Node “strength” is computed from accumulated co-visitation weights.
+- We then compute a **logical → physical permutation**:
+  - Start BFS from high-strength nodes in the co-visitation graph.
+  - Assign consecutive physical IDs so that frequently co-visited nodes are placed close together on disk pages.
+- When writing the disk index:
+  - Vectors and node records are laid out according to the physical ID permutation.
+  - Adjacency lists still use **logical IDs**, so the search logic stays simple and only the logical↔physical mapping layer knows about the disk layout.
 
-### Install Intel MKL
-#### Ubuntu 20.04
-```bash
-sudo apt install libmkl-full-dev
-```
+---
 
-#### Earlier versions of Ubuntu
-Install Intel MKL either by downloading the [oneAPI MKL installer](https://www.intel.com/content/www/us/en/developer/tools/oneapi/onemkl.html) or using [apt](https://software.intel.com/en-us/articles/installing-intel-free-libs-and-python-apt-repo) (we tested with build 2019.4-070 and 2022.1.2.146).
+### 3. Page-Based Adaptive Graph Search
 
-```
-# OneAPI MKL Installer
-wget https://registrationcenter-download.intel.com/akdlm/irc_nas/18487/l_BaseKit_p_2022.1.2.146.sh
-sudo sh l_BaseKit_p_2022.1.2.146.sh -a --components intel.oneapi.lin.mkl.devel --action install --eula accept -s
-```
-
-### Build
-```bash
-mkdir build && cd build && cmake -DCMAKE_BUILD_TYPE=Release .. && make -j 
-```
-
-## Windows build:
-
-The Windows version has been tested with Enterprise editions of Visual Studio 2022, 2019 and 2017. It should work with the Community and Professional editions as well without any changes. 
-
-**Prerequisites:**
-
-* CMake 3.15+ (available in VisualStudio 2019+ or from https://cmake.org)
-* NuGet.exe (install from https://www.nuget.org/downloads)
-    * The build script will use NuGet to get MKL, OpenMP and Boost packages.
-* DiskANN git repository checked out together with submodules. To check out submodules after git clone:
-```
-git submodule init
-git submodule update
-```
-
-* Environment variables: 
-    * [optional] If you would like to override the Boost library listed in windows/packages.config.in, set BOOST_ROOT to your Boost folder.
-
-**Build steps:**
-* Open the "x64 Native Tools Command Prompt for VS 2019" (or corresponding version) and change to DiskANN folder
-* Create a "build" directory inside it
-* Change to the "build" directory and run
-```
-cmake ..
-```
-OR for Visual Studio 2017 and earlier:
-```
-<full-path-to-installed-cmake>\cmake ..
-```
-* This will create a diskann.sln solution. Open it from VisualStudio and build either Release or Debug configuration.
-    * Alternatively, use MSBuild:
-```
-msbuild.exe diskann.sln /m /nologo /t:Build /p:Configuration="Release" /property:Platform="x64"
-```
-    * This will also build gperftools submodule for libtcmalloc_minimal dependency.
-* Generated binaries are stored in the x64/Release or x64/Debug directories.
-
-## Usage:
-
-Please see the following pages on using the compiled code:
-
-- [Commandline interface for building and search SSD based indices](workflows/SSD_index.md)  
-- [Commandline interface for building and search in memory indices](workflows/in_memory_index.md) 
-- [Commandline examples for using in-memory streaming indices](workflows/dynamic_index.md)
-- To be added: Python interfaces and docker files
+- Vanilla DiskANN-style search manages candidates per node and does not fully exploit the fact that disk I/O happens per **page/sector**, not per node.
+- Our search is **page-aware and adaptive**:
+  - Beam candidates are tracked in logical ID space.
+  - Just before issuing I/O, we map logical → physical IDs, group nodes by sector, and **batch** reads per sector.
+- When a sector is read:
+  - We parse **all nodes** in that sector and store their coordinates + neighborhoods in a **per-query local cache**.
+  - However, we only **expand neighbors** for frontier nodes selected by the beam search.
+- This means:
+  - **Caching is aggressive** (we keep as much page-level information as possible once paid for).
+  - **Graph expansion is adaptive**: nodes are only expanded when they later become frontier candidates.
+- A two-level cache is used:
+  - A **global cache** for globally hot nodes.
+  - A **per-query local page cache** for nodes in sectors touched by the current query.
+- This design lets us:
+  - Reuse already-loaded pages without additional disk I/O.
+  - Control the trade-off between I/O budget and search quality via policy (beam width, I/O limits, cache size), while keeping search semantics compatible with the baseline.
